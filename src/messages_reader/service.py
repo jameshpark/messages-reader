@@ -203,41 +203,81 @@ class _Server(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     request_queue_size = 16
 
-    def __init__(self, path: Path, store: Store) -> None:
+    def __init__(self, name: str, store: Store, dir_fd: int) -> None:
         self.store = store
         self.slots = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
-        super().__init__(str(path), _Handler)
+        super().__init__(name, _Handler)
+        self.dir_fd = dir_fd
+        self.sock_name = name
+        self.sock_inode = os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_ino
+
+    def server_close(self) -> None:
+        super().server_close()
+        try:
+            st = os.stat(self.sock_name, dir_fd=self.dir_fd, follow_symlinks=False)
+            if st.st_ino == self.sock_inode:
+                os.unlink(self.sock_name, dir_fd=self.dir_fd)
+        except FileNotFoundError:
+            pass
+        os.close(self.dir_fd)
 
 
-def _prepare_socket_dir(directory: Path) -> None:
-    directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+def _open_dir_nofollow(directory: Path) -> int:
+    """Open a directory, creating missing parts, refusing a symlink at any step.
+
+    The service holds Full Disk Access, so every filesystem change it makes
+    (mkdir, chmod, unlink, bind) goes through descriptors for directories it
+    has verified, never through a path another process could swap.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open("/", flags)
     try:
-        directory.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    st = os.lstat(directory)
-    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
-        raise SystemExit(f"{directory} must be a directory owned by uid {os.getuid()}")
-    os.chmod(directory, 0o700)
+        for part in directory.parts[1:]:
+            try:
+                os.mkdir(part, 0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except OSError as e:
+                raise SystemExit(f"{directory}: {part} is not a plain directory ({e.strerror})") from e
+            os.close(fd)
+            fd = child
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def bind(store: Store, path: Path) -> _Server:
-    _prepare_socket_dir(path.parent)
+    dir_fd = _open_dir_nofollow(path.parent)
     try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        pass
-    else:
-        if not stat.S_ISSOCK(st.st_mode):
-            raise SystemExit(f"{path} exists and is not a socket")
-        path.unlink()
-    old_umask = os.umask(0o177)
-    try:
-        server = _Server(path, store)
-    finally:
-        os.umask(old_umask)
-    os.chmod(path, 0o600)
-    return server
+        if os.fstat(dir_fd).st_uid != os.getuid():
+            raise SystemExit(f"{path.parent} must be owned by uid {os.getuid()}")
+        os.fchmod(dir_fd, 0o700)
+        name = path.name
+        try:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISSOCK(st.st_mode):
+                raise SystemExit(f"{path} exists and is not a socket")
+            os.unlink(name, dir_fd=dir_fd)
+        # bind() takes a path, so bind a bare name from inside the verified
+        # directory; umask makes the socket 0600 as it is created.
+        cwd = os.open(".", os.O_RDONLY)
+        old_umask = os.umask(0o177)
+        try:
+            os.fchdir(dir_fd)
+            return _Server(name, store, dir_fd)
+        finally:
+            os.umask(old_umask)
+            os.fchdir(cwd)
+            os.close(cwd)
+    except BaseException:
+        os.close(dir_fd)
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -250,7 +290,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     path = paths.socket_path()
     server = bind(Store(), path)
-    inode = os.lstat(path).st_ino
     # launchd stops the job with SIGTERM; exit through serve_forever's finally.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     log.info("listening on %s", path)
@@ -258,9 +297,4 @@ def main(argv: list[str] | None = None) -> int:
         server.serve_forever()
     finally:
         server.server_close()
-        try:
-            if os.lstat(path).st_ino == inode:
-                path.unlink()
-        except FileNotFoundError:
-            pass
     return 0

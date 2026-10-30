@@ -21,7 +21,7 @@ APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
 MAX_TEXT_CHARS = 4000
 # Tapbacks and sticker reactions carry associated_message_type 2000-3999.
 _REACTION_TYPES = range(2000, 4000)
-_PHONE_RE = re.compile(r"\+?[\d\s().-]{7,}")
+_PHONE_RE = re.compile(r"\+?[\d\s().-]+", re.ASCII)
 _CHAT_TARGET_RE = re.compile(r"chat:(\d{1,18})")
 
 _ALLOWED_SQL_ACTIONS = frozenset(
@@ -115,6 +115,11 @@ def handle_key(handle: str) -> str:
     return digits
 
 
+def _is_phone(value: str) -> bool:
+    """Phone numbers and SMS short codes: phone punctuation with at least 3 digits."""
+    return bool(_PHONE_RE.fullmatch(value)) and sum(ch.isdigit() for ch in value) >= 3
+
+
 def _clean_text(text: str | None) -> str:
     if not text:
         return ""
@@ -199,7 +204,7 @@ class Store:
 
     def contact(self, query: str, limit: int) -> dict:
         q = query.strip()
-        q_key = handle_key(q) if ("@" in q or _PHONE_RE.fullmatch(q)) else None
+        q_key = handle_key(q) if ("@" in q or _is_phone(q)) else None
         needle = q.casefold()
         matches = []
         for contact in self.contacts():
@@ -357,7 +362,7 @@ class Store:
             if not conn.execute("SELECT 1 FROM chat WHERE ROWID = ?", (chat_id,)).fetchone():
                 raise RequestError(f"no chat with id {chat_id}")
             return [chat_id]
-        if "@" in target or _PHONE_RE.fullmatch(target):
+        if "@" in target or _is_phone(target):
             keys = {handle_key(target)}
         else:
             needle = target.casefold()

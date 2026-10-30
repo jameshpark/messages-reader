@@ -300,3 +300,17 @@ def test_handle_key(raw, key):
     from messages_reader.store import handle_key
 
     assert handle_key(raw) == key
+
+
+def test_sms_short_codes_are_numeric_targets(dbs):
+    chat, ab = dbs
+    conn = sqlite3.connect(chat)
+    conn.execute("INSERT INTO handle VALUES (6, '12345', 'SMS')")
+    conn.execute("INSERT INTO chat VALUES (15, 'SMS;-;12345', '12345', '', 45)")
+    conn.execute("INSERT INTO chat_handle_join VALUES (15, 6)")
+    conn.commit()
+    conn.close()
+    _add_message(chat, 40, 6, 15, "Your code is 000000")
+    store = Store(lambda: chat, lambda: [ab])
+    assert [r["id"] for r in store.thread("12345", limit=10)["rows"]] == [40]
+    assert store.attachments(target="12345", days=30, limit=10)["rows"] == []

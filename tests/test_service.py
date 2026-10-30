@@ -102,10 +102,15 @@ def test_client_never_touches_databases():
     assert "sqlite3" not in imported and "store" not in imported
 
 
+def _tmpdir() -> Path:
+    # Resolved because /tmp is a symlink; sun_path's 104-byte limit rules out tmp_path.
+    return Path(tempfile.mkdtemp(prefix="mr-", dir="/tmp")).resolve()
+
+
 @pytest.fixture
 def running(store):
     # sun_path is limited to 104 bytes, so keep the path short.
-    root = Path(tempfile.mkdtemp(prefix="mr-", dir="/tmp"))
+    root = _tmpdir()
     sock_path = root / "state" / "s.sock"
     server = service.bind(store, sock_path)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -171,7 +176,7 @@ def test_peer_uid_is_the_connecting_user(running):
 
 
 def test_bind_refuses_a_non_socket_in_the_way(store):
-    root = Path(tempfile.mkdtemp(prefix="mr-", dir="/tmp"))
+    root = _tmpdir()
     try:
         (root / "s.sock").write_text("not a socket")
         with pytest.raises(SystemExit, match="not a socket"):
@@ -181,7 +186,7 @@ def test_bind_refuses_a_non_socket_in_the_way(store):
 
 
 def test_bind_tightens_a_loose_directory(store):
-    root = Path(tempfile.mkdtemp(prefix="mr-", dir="/tmp"))
+    root = _tmpdir()
     try:
         os.chmod(root, 0o755)
         server = service.bind(store, root / "s.sock")
@@ -192,11 +197,11 @@ def test_bind_tightens_a_loose_directory(store):
 
 
 def test_bind_refuses_a_symlinked_directory(store):
-    root = Path(tempfile.mkdtemp(prefix="mr-", dir="/tmp"))
+    root = _tmpdir()
     try:
         (root / "real").mkdir()
         (root / "link").symlink_to(root / "real")
-        with pytest.raises(SystemExit, match="must be a directory"):
+        with pytest.raises(SystemExit, match="not a plain directory"):
             service.bind(store, root / "link" / "s.sock")
     finally:
         shutil.rmtree(root)
@@ -204,3 +209,47 @@ def test_bind_refuses_a_symlinked_directory(store):
 
 def test_service_main_rejects_arguments():
     assert service.main(["--send"]) == 2
+
+
+def test_bind_never_changes_permissions_through_a_path(store, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("path-based chmod follows symlinks")
+
+    monkeypatch.setattr(os, "chmod", refuse)
+    monkeypatch.setattr(os, "lchmod", refuse, raising=False)
+    root = _tmpdir()
+    try:
+        server = service.bind(store, root / "state" / "s.sock")
+        assert stat.S_IMODE(os.lstat(root / "state" / "s.sock").st_mode) == 0o600
+        server.server_close()
+    finally:
+        shutil.rmtree(root)
+
+
+def test_bind_refuses_a_symlink_at_the_socket_name(store):
+    root = _tmpdir()
+    try:
+        victim = root / "victim"
+        victim.write_text("protected")
+        victim.chmod(0o644)
+        (root / "s.sock").symlink_to(victim)
+        with pytest.raises(SystemExit, match="not a socket"):
+            service.bind(store, root / "s.sock")
+        assert stat.S_IMODE(victim.stat().st_mode) == 0o644 and victim.read_text() == "protected"
+    finally:
+        shutil.rmtree(root)
+
+
+def test_close_only_removes_its_own_socket_even_if_the_directory_is_swapped(store):
+    root = _tmpdir()
+    try:
+        server = service.bind(store, root / "state" / "s.sock")
+        (root / "state").rename(root / "moved")
+        (root / "other").mkdir()
+        (root / "other" / "s.sock").write_text("someone else's file")
+        (root / "state").symlink_to(root / "other")
+        server.server_close()
+        assert (root / "other" / "s.sock").read_text() == "someone else's file"
+        assert not (root / "moved" / "s.sock").exists()
+    finally:
+        shutil.rmtree(root)
