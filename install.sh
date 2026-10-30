@@ -16,6 +16,7 @@ SERVICE_BIN=$REPO/bin/messages-reader-service
 CLIENT_BIN=$HOME/.local/bin/messages-read
 PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
 LOG=$HOME/Library/Logs/messages-reader.log
+SOCKET=$HOME/.local/state/messages-reader/messages-reader.sock
 DOMAIN=gui/$(id -u)
 
 stop_service() {
@@ -45,32 +46,55 @@ elif [[ $# -gt 0 ]]; then
     exit 2
 fi
 
-# Keep every build cache inside the repo and never download a Python.
-export UV_PYTHON_DOWNLOADS=never
-export UV_CACHE_DIR=$REPO/.cache/uv
-export PYINSTALLER_CONFIG_DIR=$REPO/.cache/pyinstaller
 cd "$REPO"
+swift test
+swift build -c release --product messages-reader-service
+swift build -c release --product messages-read
+OUT=$(swift build -c release --show-bin-path)
 
-uv sync --frozen --python '3.14+gil'
-uv run --frozen pytest -q
-
-build() {
-    uv run --frozen pyinstaller --noconfirm --clean --onefile --log-level WARN \
-        --name "$1" --paths "$REPO/src" \
-        --distpath "$REPO/build/dist" --workpath "$REPO/build/work" --specpath "$REPO/build/spec" \
-        "$REPO/packaging/$2"
-    # Hardened runtime ignores DYLD_* variables and refuses debugger attach,
-    # so nothing can inject code into the process that holds Full Disk Access.
-    codesign --force --options runtime --entitlements "$REPO/packaging/entitlements.plist" \
-        --sign - "$REPO/build/dist/$1"
+fail() {
+    echo "refusing to install: $*" >&2
+    exit 1
 }
-build messages-reader-service service_entry.py
-build messages-read client_entry.py
+
+# Sign ad hoc with the hardened runtime and no entitlements, then check the
+# result. Ad hoc means the designated requirement is the binary's cdhash, so a
+# Full Disk Access grant covers this exact build and nothing else. Hardened
+# runtime with no entitlements keeps library validation on, ignores DYLD_*
+# variables and refuses debugger attach. Only system libraries are linked and
+# there are no rpaths, so nothing loads from a writable location.
+seal() {
+    local bin=$1 id=$2 rpath
+    while rpath=$(otool -l "$bin" | awk '$1 == "cmd" && $2 == "LC_RPATH" {getline; getline; print $2; exit}') \
+        && [[ -n $rpath ]]; do
+        # (It warns that this invalidates the signature; we re-sign next.)
+        install_name_tool -delete_rpath "$rpath" "$bin" 2>/dev/null || fail "$bin: cannot delete rpath $rpath"
+    done
+    codesign --force --options runtime --identifier "$id" --sign - "$bin"
+
+    codesign --verify --strict "$bin" || fail "$bin: signature does not verify"
+    # Capture before matching: grep -q exits early and pipefail would count
+    # the writer's SIGPIPE as a failure.
+    local info loads
+    info=$(codesign -dv "$bin" 2>&1)
+    [[ $info == *$'\n'"CodeDirectory "*"flags="*"(adhoc,runtime)"* ]] || fail "$bin: not ad hoc with hardened runtime"
+    [[ -z $(codesign -d --entitlements - "$bin" 2>/dev/null) ]] || fail "$bin: has entitlements"
+    loads=$(otool -l "$bin")
+    [[ $loads != *LC_RPATH* ]] || fail "$bin: still has an LC_RPATH"
+    local lib
+    while read -r lib _; do
+        [[ $lib == /usr/lib/* || $lib == /System/Library/* ]] || fail "$bin links $lib"
+    done < <(otool -L "$bin" | tail -n +2)
+}
+mkdir -p "$REPO/.build/sealed"
+cp "$OUT/messages-reader-service" "$OUT/messages-read" "$REPO/.build/sealed/"
+seal "$REPO/.build/sealed/messages-reader-service" "$LABEL-service"
+seal "$REPO/.build/sealed/messages-read" "$LABEL-client"
 
 stop_service
 mkdir -p "$REPO/bin" "$(dirname "$CLIENT_BIN")" "$(dirname "$PLIST")" "$(dirname "$LOG")"
-install_file "$REPO/build/dist/messages-reader-service" "$SERVICE_BIN"
-install_file "$REPO/build/dist/messages-read" "$CLIENT_BIN"
+install_file "$REPO/.build/sealed/messages-reader-service" "$SERVICE_BIN"
+install_file "$REPO/.build/sealed/messages-read" "$CLIENT_BIN"
 
 cat >"$PLIST.tmp.$$" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -101,7 +125,7 @@ mv -f "$PLIST.tmp.$$" "$PLIST"
 launchctl bootstrap "$DOMAIN" "$PLIST"
 
 for _ in $(seq 100); do
-    [[ -S $HOME/.local/state/messages-reader/messages-reader.sock ]] && break
+    [[ -S $SOCKET ]] && break
     sleep 0.1
 done
 env -i PATH=/usr/bin:/bin "$CLIENT_BIN" check || true
@@ -111,5 +135,6 @@ cat <<EOF
 Installed. Grant Full Disk Access to this exact file (needed again after every rebuild):
   $SERVICE_BIN
   cdhash: $(codesign -dvvv "$SERVICE_BIN" 2>&1 | sed -n 's/^CDHash=//p')
+  designated requirement: $(codesign -d -r- "$SERVICE_BIN" 2>&1 | sed -n 's/^# designated => //p')
 then run: launchctl kickstart -k $DOMAIN/$LABEL
 EOF
