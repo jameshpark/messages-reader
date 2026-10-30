@@ -55,8 +55,9 @@ def decode_attributed_body(blob: bytes | None) -> str | None:
     New macOS versions often leave ``message.text`` NULL and store the text
     only here. The blob is an NSArchiver typedstream of an
     NSAttributedString: the first ``NSString`` class name is followed by a
-    5-byte header and a length-prefixed UTF-8 string. Lengths below 0x80 are
-    one byte; 0x81/0x82/0x83 introduce a 2/3/4-byte little-endian length.
+    5-byte header and a length-prefixed UTF-8 string. Typedstream integers
+    below 0x80 are one byte; 0x81 introduces a 2-byte and 0x82 a 4-byte
+    little-endian value (checked against NSArchiver output on macOS 27).
 
     Adapted from mac_messages_mcp (MIT, Copyright (c) 2023 Carter Lasalle).
     """
@@ -72,8 +73,8 @@ def decode_attributed_body(blob: bytes | None) -> str | None:
     pos += 1
     if lead < 0x80:
         length = lead
-    elif lead in (0x81, 0x82, 0x83):
-        width = lead - 0x7F
+    elif lead in (0x81, 0x82):
+        width = 2 if lead == 0x81 else 4
         if pos + width > len(blob):
             return None
         length = int.from_bytes(blob[pos : pos + width], "little")
@@ -98,12 +99,20 @@ def apple_ns_since(delta: timedelta) -> int:
 
 
 def handle_key(handle: str) -> str:
-    """Normalize a phone number or email so differently formatted handles compare equal."""
+    """Normalize a phone number or email so differently formatted handles compare equal.
+
+    Phone numbers become country code + national number. A number written
+    with a leading + keeps its country code as given; without one, 10 digits
+    (or 11 starting with 1) are taken as US/NANP numbers. Anything else is
+    compared as its bare digits, so numbers are never merged across countries.
+    """
     handle = handle.strip()
     if "@" in handle:
         return handle.casefold()
     digits = re.sub(r"\D", "", handle)
-    return digits[-10:] if len(digits) >= 10 else digits
+    if not handle.startswith("+") and len(digits) == 10:
+        return "1" + digits
+    return digits
 
 
 def _clean_text(text: str | None) -> str:
@@ -244,18 +253,12 @@ class Store:
     def search(self, query: str, days: int, limit: int) -> dict:
         since = apple_ns_since(timedelta(days=days))
         needle = query.casefold()
-        like = "%" + re.sub(r"([\\%_])", r"\\\1", query) + "%"
         matched = []
         with self._chat() as conn:
-            # text LIKE prefilters plain-text rows; attributedBody-only rows
-            # have to be decoded before they can be matched.
+            # Match in Python, not with SQL LIKE: LIKE folds only ASCII case and
+            # can't see text that exists only in attributedBody.
             cursor = conn.execute(
-                f"""{_MESSAGE_SELECT}
-                WHERE m.date >= ?
-                  AND (m.text LIKE ? ESCAPE '\\'
-                       OR (COALESCE(m.text, '') = '' AND m.attributedBody IS NOT NULL))
-                ORDER BY m.date DESC""",
-                (since, like),
+                f"{_MESSAGE_SELECT} WHERE m.date >= ? ORDER BY m.date DESC", (since,)
             )
             for row in cursor:
                 body = _clean_text(row["text"] or decode_attributed_body(row["attributedBody"]))

@@ -37,12 +37,13 @@ def typedstream(text: str) -> bytes:
     """An attributedBody blob shaped like the ones Messages writes."""
     data = text.encode()
     n = len(data)
+    # Same integer encoding NSArchiver writes (checked with Foundation on macOS 27).
     if n < 0x80:
         length = bytes([n])
-    elif n < 0x10000:
+    elif n < 0x8000:
         length = b"\x81" + n.to_bytes(2, "little")
     else:
-        length = b"\x82" + n.to_bytes(3, "little")
+        length = b"\x82" + n.to_bytes(4, "little")
     return (
         b"\x04\x0bstreamtyped\x81\xe8\x03\x84\x01@\x84\x84\x84\x12NSAttributedString\x00"
         b"\x84\x84\x08NSObject\x00\x85\x92\x84\x84\x84\x08NSString\x01\x94\x84\x01+"

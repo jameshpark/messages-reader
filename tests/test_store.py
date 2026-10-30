@@ -226,3 +226,77 @@ def test_missing_addressbook_still_answers(dbs):
     store = Store(lambda: chat, lambda: [Path("/nonexistent/AddressBook-v22.abcddb")])
     rows = store.recent(hours=24, limit=50)["rows"]
     assert rows and all(r["sender_name"] is None for r in rows)
+
+
+# NSArchiver output for NSAttributedString of 32768 and 70000 "a"s, from the
+# NSString marker through the length (generated with Foundation on macOS 27).
+@pytest.mark.parametrize(
+    "header, n",
+    [
+        (b"NSString\x01\x94\x84\x01+\x81\xff\x7f", 32767),
+        (b"NSString\x01\x94\x84\x01+\x82\x00\x80\x00\x00", 32768),
+        (b"NSString\x01\x94\x84\x01+\x82\x70\x11\x01\x00", 70000),
+    ],
+)
+def test_decode_matches_foundation_length_encoding(header, n):
+    assert decode_attributed_body(b"\x04\x0bstreamtyped" + header + b"a" * n + b"\x86") == "a" * n
+
+
+def _add_message(chat: Path, rowid: int, handle: int, chat_id: int, text: str | None, body: bytes | None = None):
+    conn = sqlite3.connect(chat)
+    date = conn.execute("SELECT MAX(date) FROM message").fetchone()[0] + 1
+    conn.execute(
+        "INSERT INTO message (ROWID, guid, text, attributedBody, handle_id, date, is_from_me) VALUES (?, ?, ?, ?, ?, ?, 0)",
+        (rowid, f"guid-{rowid}", text, body, handle, date),
+    )
+    conn.execute("INSERT INTO chat_message_join VALUES (?, ?, ?)", (chat_id, rowid, date))
+    conn.commit()
+    conn.close()
+
+
+def test_search_folds_unicode_case_in_plain_text_rows(dbs, store):
+    chat, _ = dbs
+    _add_message(chat, 20, 4, 13, "Rendez-vous à l'École")
+    _add_message(chat, 21, 4, 13, "Die Straße ist gesperrt")
+    _add_message(chat, 22, 4, 13, None, typedstream("ÉCOLE again"))
+    assert [r["id"] for r in store.search("école", days=30, limit=10)["rows"]] == [22, 20]
+    assert [r["id"] for r in store.search("STRASSE", days=30, limit=10)["rows"]] == [21]
+
+
+def test_phone_numbers_from_different_countries_never_merge(dbs):
+    chat, ab = dbs
+    conn = sqlite3.connect(chat)
+    conn.execute("INSERT INTO handle VALUES (5, '+12079460123', 'iMessage')")
+    conn.execute("INSERT INTO chat VALUES (14, 'iMessage;-;+12079460123', '+12079460123', '', 45)")
+    conn.execute("INSERT INTO chat_handle_join VALUES (14, 5)")
+    conn.commit()
+    conn.close()
+    _add_message(chat, 30, 5, 14, "from Maine")
+    conn = sqlite3.connect(ab)
+    conn.execute("INSERT INTO ZABCDRECORD VALUES (5, 'Pat', 'London', NULL, NULL)")
+    conn.execute("INSERT INTO ZABCDPHONENUMBER VALUES (5, 5, '+44 20 7946 0123')")
+    conn.commit()
+    conn.close()
+    store = Store(lambda: chat, lambda: [ab])
+    assert next(r for r in store.recent(hours=1, limit=50)["rows"] if r["id"] == 30)["sender_name"] is None
+    assert store.contact("+1 207 946 0123", limit=10)["rows"] == []
+    with pytest.raises(RequestError, match="no Messages handle"):
+        store.thread("Pat London", limit=10)
+    assert [r["id"] for r in store.thread("(207) 946-0123", limit=10)["rows"]] == [30]
+
+
+@pytest.mark.parametrize(
+    "raw, key",
+    [
+        ("+1 (555) 123-0001", "15551230001"),
+        ("(555) 123-0001", "15551230001"),
+        ("15551230001", "15551230001"),
+        ("+44 20 7946 0123", "442079460123"),
+        ("12345", "12345"),
+        (" Alex@Example.COM ", "alex@example.com"),
+    ],
+)
+def test_handle_key(raw, key):
+    from messages_reader.store import handle_key
+
+    assert handle_key(raw) == key
