@@ -1,4 +1,11 @@
 #!/bin/bash
+# WARNING: running this revokes the Full Disk Access grant, even for the
+# restored original binary. On 2026-10-30 the swapped binary was denied as
+# expected, but the restored original (same bytes and cdhash) stayed denied
+# afterwards. Re-grant bin/messages-reader-service in System Settings and run
+# `launchctl kickstart -k gui/$(id -u)/com.jamespark.messages-reader` after
+# every run. Expect step 3 to report false and the script to end INCONCLUSIVE.
+#
 # Run after granting Full Disk Access to bin/messages-reader-service.
 #
 # Proves the grant is pinned to the signature, not the path: a different

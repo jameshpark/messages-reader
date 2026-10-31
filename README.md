@@ -65,7 +65,9 @@ rebuild after any change.
    and add `~/repos/personal/messages-reader/bin/messages-reader-service`.
 3. `launchctl kickstart -k gui/$(id -u)/com.jamespark.messages-reader`
 4. `messages-read check` should say `full_disk_access: True`.
-5. After the first grant, run `scripts/verify-fda-pinning.sh` once (below).
+
+Don't run `scripts/verify-fda-pinning.sh` after a grant unless you mean to
+redo the grant (below).
 
 ### Why ad hoc signing, and why the grant needs redoing
 
@@ -91,6 +93,12 @@ can't attach, so nothing can inject code into the process that holds access.
 a re-signed copy (same code, different cdhash) into the install path and
 expects `check` to lose access, then restores the original and expects access
 back.
+
+**Running it revokes the Full Disk Access grant, even for the restored
+original.** On 2026-10-30 the swapped binary was denied, which proves the
+grant doesn't follow the path. But the restored original (same bytes, same
+cdhash) stayed denied until the grant was redone, so the script ends
+INCONCLUSIVE. After any run, redo steps 1-4 above.
 
 ## Upgrade
 
